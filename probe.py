@@ -9,9 +9,13 @@ Usage:
     python probe.py --model llama3.1:8b --categories geometry reasoning
     python probe.py --model llama3.1:8b --verbose
     python probe.py --model llama3.1:8b --output-dir ./my_reports
+
+    # Compare multiple models side by side:
+    python probe.py --compare llama3.1:8b-text-q4_K_M mistral:7b-text gemma2:9b
 """
 
 import argparse
+import json
 import sys
 import os
 from datetime import datetime
@@ -26,6 +30,20 @@ from llm_probe.reporter  import (
     print_header, print_category, print_summary,
     print_training_recommendations, save_json, save_markdown,
 )
+
+# ── Colours ────────────────────────────────────────────────────────────────
+RED    = "\033[0;31m"
+GREEN  = "\033[0;32m"
+YELLOW = "\033[1;33m"
+CYAN   = "\033[0;36m"
+BOLD   = "\033[1m"
+DIM    = "\033[2m"
+NC     = "\033[0m"
+
+def _sc(score):
+    if score >= 75: return GREEN
+    if score >= 50: return YELLOW
+    return RED
 
 
 def run_category(category_key: str, backend, verbose: bool) -> tuple:
@@ -75,6 +93,152 @@ def build_report(model_name: str, backend_name: str, all_results: dict, all_scor
     }
 
 
+def run_model(model_name: str, categories: list, backend_force: str = None) -> dict:
+    """Run all probes for one model. Returns scores dict keyed by category."""
+    print(f"\n  {BOLD}── {model_name} ──{NC}")
+    backend = get_backend(model_name, force=backend_force)
+    all_results = {}
+    all_scores  = {}
+    for key in categories:
+        results, cs = run_category(key, backend, verbose=False)
+        all_results[key] = results
+        all_scores[key]  = cs
+    return {
+        "model":      model_name,
+        "backend":    backend.name(),
+        "scores":     all_scores,
+        "results":    all_results,
+        "overall":    overall_score(all_scores),
+        "grade":      grade(overall_score(all_scores)),
+        "timestamp":  datetime.now().isoformat(),
+    }
+
+
+def print_comparison(model_data: list, categories: list):
+    """Print side-by-side comparison table to terminal."""
+    names = [d["model"].split(":")[0][:12] for d in model_data]  # short names
+    col   = 10
+    pad   = 28
+
+    print(f"\n{BOLD}{CYAN}╔══════════════════════════════════════════════════════════════╗{NC}")
+    print(f"{BOLD}{CYAN}║              llm-probe — Model Comparison                    ║{NC}")
+    print(f"{BOLD}{CYAN}╚══════════════════════════════════════════════════════════════╝{NC}\n")
+
+    # Header row
+    header = f"  {'Category':<{pad}}"
+    for d in model_data:
+        short = d["model"].split(":")[0][:col]
+        header += f"  {short:>{col}}"
+    print(f"{BOLD}{header}{NC}")
+    print(f"  {'─' * pad}" + f"  {'─' * col}" * len(model_data))
+
+    # Category rows
+    for key in categories:
+        label = ALL_CATEGORIES[key]["label"][:pad]
+        row   = f"  {label:<{pad}}"
+        for d in model_data:
+            sc = d["scores"][key]["score"]
+            c  = _sc(sc)
+            row += f"  {c}{sc:>{col-1}}%{NC}"
+        print(row)
+
+    # Separator
+    print(f"  {'─' * pad}" + f"  {'─' * col}" * len(model_data))
+
+    # Overall row
+    row = f"  {BOLD}{'Overall':<{pad}}{NC}"
+    for d in model_data:
+        sc = d["overall"]
+        c  = _sc(sc)
+        row += f"  {c}{BOLD}{sc:>{col-1}}%{NC}"
+    print(row)
+
+    # Grade row
+    row = f"  {'Grade':<{pad}}"
+    for d in model_data:
+        row += f"  {d['grade']:>{col}}"
+    print(row)
+    print()
+
+    # Winner per category
+    print(f"{BOLD}  ── Strongest model per category: ─────────────────────────────{NC}\n")
+    for key in categories:
+        label  = ALL_CATEGORIES[key]["label"]
+        scores = [(d["model"].split(":")[0], d["scores"][key]["score"]) for d in model_data]
+        best   = max(scores, key=lambda x: x[1])
+        tied   = [n for n, s in scores if s == best[1]]
+        winner = " & ".join(tied) if len(tied) > 1 else best[0]
+        print(f"  {label:<35} {GREEN}{winner}{NC} ({best[1]}%)")
+    print()
+
+
+def save_comparison(model_data: list, categories: list, output_dir: str) -> tuple:
+    """Save comparison as JSON and Markdown."""
+    os.makedirs(output_dir, exist_ok=True)
+    ts    = datetime.now().strftime("%Y%m%d_%H%M")
+    names = "_vs_".join(d["model"].replace(":", "_").replace("/", "_")[:12] for d in model_data)
+
+    # JSON
+    json_path = os.path.join(output_dir, f"compare_{names}_{ts}.json")
+    with open(json_path, "w") as f:
+        json.dump(model_data, f, indent=2)
+
+    # Markdown
+    md_path = os.path.join(output_dir, f"compare_{names}_{ts}.md")
+    lines = [
+        "# llm-probe — Model Comparison",
+        "",
+        f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "",
+        "## Scores",
+        "",
+    ]
+
+    # Table header
+    header = "| Category |" + "".join(f" {d['model'].split(':')[0]} |" for d in model_data)
+    sep    = "|----------|" + "".join("---------|" for _ in model_data)
+    lines += [header, sep]
+
+    for key in categories:
+        label = ALL_CATEGORIES[key]["label"]
+        row   = f"| {label} |"
+        for d in model_data:
+            sc  = d["scores"][key]["score"]
+            row += f" {sc}% |"
+        lines.append(row)
+
+    # Overall
+    overall_row = "| **Overall** |" + "".join(f" **{d['overall']}%** |" for d in model_data)
+    grade_row   = "| **Grade** |"   + "".join(f" **{d['grade']}** |"    for d in model_data)
+    lines += [overall_row, grade_row, "", "---", "", "## Winner Per Category", ""]
+
+    for key in categories:
+        label  = ALL_CATEGORIES[key]["label"]
+        scores = [(d["model"].split(":")[0], d["scores"][key]["score"]) for d in model_data]
+        best   = max(scores, key=lambda x: x[1])
+        tied   = [n for n, s in scores if s == best[1]]
+        winner = " & ".join(tied) if len(tied) > 1 else best[0]
+        lines.append(f"- **{label}**: {winner} ({best[1]}%)")
+
+    lines += ["", "---", "", "## Pre-Training Recommendation for Forge", ""]
+    lines.append("Based on the weakest categories across all models, priority SFT data:")
+    lines.append("")
+
+    avg_scores = {}
+    for key in categories:
+        avg = sum(d["scores"][key]["score"] for d in model_data) / len(model_data)
+        avg_scores[key] = round(avg)
+
+    for key, avg in sorted(avg_scores.items(), key=lambda x: x[1]):
+        label = ALL_CATEGORIES[key]["label"]
+        lines.append(f"- **{label}** (avg {avg}%) — {'high priority' if avg < 60 else 'medium priority' if avg < 75 else 'strong baseline'}")
+
+    with open(md_path, "w") as f:
+        f.write("\n".join(lines))
+
+    return json_path, md_path
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="llm-probe — evaluate a base LLM before fine-tuning",
@@ -85,11 +249,16 @@ Examples:
   python probe.py --model llama3.1:8b --categories geometry reasoning
   python probe.py --model llama3.1:8b --verbose
   python probe.py --model meta-llama/Meta-Llama-3.1-8B --backend hf
+  python probe.py --compare llama3.1:8b-text-q4_K_M mistral:7b-text gemma2:9b
         """,
     )
     parser.add_argument(
-        "--model", required=True,
+        "--model", default=None,
         help="Model name. For Ollama: 'llama3.1:8b'. For HF: 'meta-llama/Meta-Llama-3.1-8B'",
+    )
+    parser.add_argument(
+        "--compare", nargs="+", default=None, metavar="MODEL",
+        help="Compare multiple models side by side",
     )
     parser.add_argument(
         "--backend", choices=["ollama", "hf"], default=None,
@@ -116,7 +285,25 @@ Examples:
 
     args = parser.parse_args()
 
-    # ── Backend ────────────────────────────────────────────────────────────
+    if not args.model and not args.compare:
+        parser.error("Provide --model for a single run or --compare for multi-model comparison.")
+
+    # ── Compare mode ───────────────────────────────────────────────────────
+    if args.compare:
+        print(f"\n{BOLD}  llm-probe — Comparing {len(args.compare)} models{NC}")
+        print(f"  {DIM}Models: {', '.join(args.compare)}{NC}\n")
+        model_data = []
+        for model_name in args.compare:
+            data = run_model(model_name, args.categories, args.backend)
+            model_data.append(data)
+        print_comparison(model_data, args.categories)
+        if not args.no_save:
+            json_path, md_path = save_comparison(model_data, args.categories, args.output_dir)
+            print(f"  Comparison reports saved:")
+            print(f"    JSON     : {json_path}")
+            print(f"    Markdown : {md_path}")
+            print()
+        return
     print()
     print("  Detecting backend...")
     backend = get_backend(args.model, force=args.backend)
