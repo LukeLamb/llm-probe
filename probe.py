@@ -24,8 +24,9 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(__file__))
 
 from llm_probe.backends  import get_backend
-from llm_probe.probes    import ALL_CATEGORIES
-from llm_probe.scorer    import score_probe, score_consistency_probe, category_score, overall_score, grade
+from llm_probe.probes    import ALL_CATEGORIES, DEEP_CATEGORIES, STANDARD_CATEGORIES
+from llm_probe.scorer    import (score_probe, score_consistency_probe, score_mirror_pair,
+                                  category_score, overall_score, grade)
 from llm_probe.reporter  import (
     print_header, print_category, print_summary,
     print_training_recommendations, save_json, save_markdown,
@@ -55,19 +56,46 @@ def run_category(category_key: str, backend, verbose: bool) -> tuple:
 
     print(f"  Running: {label}...", end="", flush=True)
 
-    for probe in probes:
-        if category_key == "consistency":
+    # Mirror pairs — run both sides and score together
+    if category_key == "bias":
+        paired = {}
+        for probe in probes:
+            completion = backend.generate(probe["prompt"], max_tokens=80, temperature=0.1)
+            paired[probe["id"]] = (probe, completion)
+
+        processed = set()
+        for probe_id, (probe, completion) in paired.items():
+            if probe_id in processed:
+                continue
+            pair_id = probe.get("pair")
+            if pair_id and pair_id in paired:
+                probe_b, completion_b = paired[pair_id]
+                result_a, result_b = score_mirror_pair(
+                    probe, completion, probe_b, completion_b
+                )
+                results.extend([result_a, result_b])
+                processed.add(probe_id)
+                processed.add(pair_id)
+            else:
+                result = score_probe(probe, completion)
+                results.append(result)
+                processed.add(probe_id)
+
+    elif category_key == "consistency":
+        for probe in probes:
             runs = probe.get("runs", 3)
             completions = [
                 backend.generate(probe["prompt"], max_tokens=60, temperature=0.7)
                 for _ in range(runs)
             ]
             result = score_consistency_probe(probe, completions)
-        else:
+            results.append(result)
+
+    else:
+        for probe in probes:
             completion = backend.generate(probe["prompt"], max_tokens=80, temperature=0.1)
             result = score_probe(probe, completion)
-
-        results.append(result)
+            results.append(result)
 
     cs = category_score(results)
     print(f" {cs['passed']}/{cs['total']} passed ({cs['score']}%)")
@@ -267,8 +295,12 @@ Examples:
     parser.add_argument(
         "--categories", nargs="+",
         choices=list(ALL_CATEGORIES.keys()),
-        default=list(ALL_CATEGORIES.keys()),
-        help="Categories to run. Default: all",
+        default=None,
+        help="Specific categories to run. Default: standard 6. Use --deep for all 9.",
+    )
+    parser.add_argument(
+        "--deep", action="store_true",
+        help="Run all 9 categories including bias, safety boundary, and residue probes",
     )
     parser.add_argument(
         "--verbose", action="store_true",
@@ -287,6 +319,15 @@ Examples:
 
     if not args.model and not args.compare:
         parser.error("Provide --model for a single run or --compare for multi-model comparison.")
+
+    # Resolve which categories to run
+    if args.categories:
+        active_categories = args.categories
+    elif args.deep:
+        active_categories = DEEP_CATEGORIES
+    else:
+        active_categories = STANDARD_CATEGORIES
+    args.categories = active_categories
 
     # ── Compare mode ───────────────────────────────────────────────────────
     if args.compare:
