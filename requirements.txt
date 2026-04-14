@@ -1,0 +1,5 @@
+requests>=2.28.0
+# HuggingFace backend (only needed if not using Ollama)
+# torch — install separately via ROCm wheel, see README
+transformers>=4.40.0
+accelerate>=0.27.0
