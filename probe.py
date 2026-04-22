@@ -60,7 +60,7 @@ def run_category(category_key: str, backend, verbose: bool) -> tuple:
     if category_key == "bias":
         paired = {}
         for probe in probes:
-            completion = backend.generate(probe["prompt"], max_tokens=80, temperature=0.1)
+            completion = backend.generate(probe["prompt"], max_tokens=80, temperature=0)
             paired[probe["id"]] = (probe, completion)
 
         processed = set()
@@ -92,10 +92,40 @@ def run_category(category_key: str, backend, verbose: bool) -> tuple:
             results.append(result)
 
     else:
+        # Per-probe dispatch by type field. Handles mixed-type categories
+        # like eu_political (mostly standard, with mirror pairs in sub-cat 2
+        # and boundary probes in sub-cat 5).
+        completions = {}
         for probe in probes:
-            completion = backend.generate(probe["prompt"], max_tokens=80, temperature=0.1)
-            result = score_probe(probe, completion)
-            results.append(result)
+            completions[probe["id"]] = backend.generate(probe["prompt"], max_tokens=80, temperature=0)
+
+        processed = set()
+        probe_by_id = {p["id"]: p for p in probes}
+        for probe in probes:
+            if probe["id"] in processed:
+                continue
+            ptype = probe.get("type", "standard")
+            if ptype == "mirror":
+                pair_id = probe.get("pair")
+                if pair_id and pair_id in completions:
+                    probe_b = probe_by_id[pair_id]
+                    result_a, result_b = score_mirror_pair(
+                        probe, completions[probe["id"]],
+                        probe_b, completions[pair_id]
+                    )
+                    results.extend([result_a, result_b])
+                    processed.add(probe["id"])
+                    processed.add(pair_id)
+                else:
+                    # Malformed mirror probe — score as standard
+                    result = score_probe(probe, completions[probe["id"]])
+                    results.append(result)
+                    processed.add(probe["id"])
+            else:
+                # Standard, boundary, residue all dispatch inside score_probe
+                result = score_probe(probe, completions[probe["id"]])
+                results.append(result)
+                processed.add(probe["id"])
 
     cs = category_score(results)
     print(f" {cs['passed']}/{cs['total']} passed ({cs['score']}%)")
@@ -307,8 +337,8 @@ Examples:
         help="Show individual probe completions in terminal output",
     )
     parser.add_argument(
-        "--output-dir", default="./reports",
-        help="Directory to save JSON and Markdown reports (default: ./reports)",
+        "--output-dir", default="/media/luke/Storage Device 1/NeuroForge/03_Results/Probe_Reports",
+        help="Directory to save reports (default: NeuroForge Probe_Reports)",
     )
     parser.add_argument(
         "--no-save", action="store_true",
@@ -365,7 +395,7 @@ Examples:
     # ── Terminal report ────────────────────────────────────────────────────
     for key in args.categories:
         label = ALL_CATEGORIES[key]["label"]
-        print_category(label, all_scores[key], all_results[key], verbose=args.verbose)
+        print_category(label, all_scores[key], all_results[key], verbose=args.verbose, category_key=key)
 
     ov = overall_score(all_scores)
     gr = grade(ov)

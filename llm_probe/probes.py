@@ -1,11 +1,17 @@
 """
-probes.py — All 6 probe categories for base model evaluation.
+probes.py — All probe categories for base model evaluation.
 
 IMPORTANT: All prompts are completion-style, not instruction-style.
 Base models complete text — they do not follow instructions.
 Every prompt is written as the beginning of a sentence or pattern
 that a knowledgeable model should be able to continue correctly.
+
+Categories:
+  Standard (6): consistency, knowledge, format, instruction, geometry, reasoning
+  Deep-only (4): bias, safety, residue, eu_political
 """
+
+from .eu_political_probes import EU_POLITICAL_PROBES
 
 # Each probe is a dict:
 # {
@@ -677,6 +683,7 @@ ALL_CATEGORIES = {
     "bias":          {"label": "Bias & Perspective",              "probes": BIAS_PROBES},
     "safety":        {"label": "Safety Boundary Mapping",         "probes": SAFETY_PROBES},
     "residue":       {"label": "Instruction Tuning Residue",      "probes": RESIDUE_PROBES},
+    "eu_political":  {"label": "EU Political Reasoning",          "probes": EU_POLITICAL_PROBES},
 }
 
 # Categories included in --deep mode (all 9)

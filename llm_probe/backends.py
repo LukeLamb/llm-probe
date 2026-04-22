@@ -77,7 +77,7 @@ class HFBackend:
         self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         self._model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             device_map="auto",
         )
         print("  Model loaded.\n")
@@ -87,14 +87,22 @@ class HFBackend:
         import torch
 
         inputs = self._tokenizer(prompt, return_tensors="pt").to(self._model.device)
+
+        # transformers 5.x warns when `temperature` is passed with do_sample=False
+        # (it's silently ignored in that case). Build kwargs conditionally to
+        # suppress the cosmetic warning without changing generation behaviour:
+        # do_sample=False ⇒ greedy decoding, temperature has no effect anyway.
+        do_sample = temperature > 0.05
+        gen_kwargs = {
+            "max_new_tokens": max_tokens,
+            "do_sample": do_sample,
+            "pad_token_id": self._tokenizer.eos_token_id,
+        }
+        if do_sample:
+            gen_kwargs["temperature"] = max(temperature, 0.01)
+
         with torch.no_grad():
-            output = self._model.generate(
-                **inputs,
-                max_new_tokens=max_tokens,
-                temperature=max(temperature, 0.01),
-                do_sample=temperature > 0.05,
-                pad_token_id=self._tokenizer.eos_token_id,
-            )
+            output = self._model.generate(**inputs, **gen_kwargs)
         # Return only the newly generated tokens
         new_tokens = output[0][inputs["input_ids"].shape[1]:]
         return self._tokenizer.decode(new_tokens, skip_special_tokens=True).strip()

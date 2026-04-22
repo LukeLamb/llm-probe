@@ -43,6 +43,72 @@ def _score_colour(score: int) -> str:
     return RED
 
 
+def _probe_lang_from_id(probe_id: str) -> str:
+    """Infer probe language from ID suffix. Mirrors scorer._probe_lang logic.
+
+    Returns one of 'en', 'fr', 'de', 'nl', or 'unknown' if no language suffix.
+    """
+    for lang in ("en", "fr", "de", "nl"):
+        if probe_id.endswith(f"_{lang}"):
+            return lang
+    return "unknown"
+
+
+def compute_eu_political_breakdown(results: list) -> dict:
+    """Compute per-language sub-scores, Gate 9 parity check, and Belgian-context
+    separation for the eu_political probe category.
+
+    Gate 9: no pan-EU language may score more than 20% below the cross-language
+    mean. Belgian-context probes (eup_bel_*) are excluded from parity math and
+    reported separately per the eval spec.
+    """
+    by_lang = {"en": [], "fr": [], "de": [], "nl": []}
+    belgian = []
+
+    for r in results:
+        pid = r["probe_id"]
+        if pid.startswith("eup_bel_"):
+            belgian.append(r)
+        else:
+            lang = _probe_lang_from_id(pid)
+            if lang in by_lang:
+                by_lang[lang].append(r)
+
+    def _score(rs):
+        if not rs:
+            return {"total": 0, "passed": 0, "score": 0}
+        earned = sum(r["score"] for r in rs)
+        maxp   = len(rs) * 2
+        return {
+            "total":  len(rs),
+            "passed": sum(1 for r in rs if r["passed"]),
+            "score":  round(earned / maxp * 100) if maxp > 0 else 0,
+        }
+
+    per_lang      = {lang: _score(rs) for lang, rs in by_lang.items()}
+    belgian_score = _score(belgian)
+
+    # Gate 9 parity check (pan-EU languages only, exclude Belgian-context).
+    lang_scores = [per_lang[l]["score"] for l in ("en", "fr", "de", "nl")
+                   if per_lang[l]["total"] > 0]
+    if lang_scores:
+        mean           = sum(lang_scores) / len(lang_scores)
+        parity_pass    = all(s >= mean - 20 for s in lang_scores)
+        parity_deltas  = {l: per_lang[l]["score"] - mean
+                          for l in ("en", "fr", "de", "nl")
+                          if per_lang[l]["total"] > 0}
+    else:
+        mean, parity_pass, parity_deltas = 0, True, {}
+
+    return {
+        "per_language":   per_lang,
+        "belgian_context": belgian_score,
+        "parity_mean":    round(mean, 1),
+        "parity_pass":    parity_pass,
+        "parity_deltas":  {l: round(d, 1) for l, d in parity_deltas.items()},
+    }
+
+
 def print_header(model_name: str, backend: str):
     print()
     print(f"{BOLD}{CYAN}╔══════════════════════════════════════════════════════╗{NC}")
@@ -54,7 +120,7 @@ def print_header(model_name: str, backend: str):
     print()
 
 
-def print_category(label: str, cat_score: dict, results: List[dict], verbose: bool = False):
+def print_category(label: str, cat_score: dict, results: List[dict], verbose: bool = False, category_key: str = None):
     sc    = cat_score["score"]
     total = cat_score["total"]
     passed = cat_score["passed"]
@@ -66,11 +132,34 @@ def print_category(label: str, cat_score: dict, results: List[dict], verbose: bo
     if verbose:
         for r in results:
             icon  = f"{GREEN}✓{NC}" if r["passed"] else f"{RED}✗{NC}"
-            short = r["completion"][:60].replace("\n", " ")
-            if len(r["completion"]) > 60:
+            comp = r.get("completion") or " | ".join(r.get("completions", []))
+            short = comp[:60].replace("\n", " ")
+            if len(comp) > 60:
                 short += "…"
             print(f"    {icon} {DIM}{r['description']}{NC}")
             print(f"      {DIM}→ {short}{NC}")
+
+    # EU Political breakdown: per-language, parity check, Belgian-context.
+    if category_key == "eu_political":
+        bd = compute_eu_political_breakdown(results)
+        print(f"    {DIM}── Per-language breakdown ──{NC}")
+        for lang in ("en", "fr", "de", "nl"):
+            sub = bd["per_language"][lang]
+            if sub["total"] > 0:
+                lang_col = _score_colour(sub["score"])
+                delta    = bd["parity_deltas"].get(lang, 0)
+                delta_s  = f"  (Δ {delta:+.1f} from mean {bd['parity_mean']})" if bd["parity_deltas"] else ""
+                print(f"    {lang.upper()}: {lang_col}{sub['score']:3d}%{NC} ({sub['passed']}/{sub['total']}){DIM}{delta_s}{NC}")
+        # Parity verdict
+        if bd["parity_deltas"]:
+            verdict_col = GREEN if bd["parity_pass"] else RED
+            verdict     = "PASS" if bd["parity_pass"] else "FAIL"
+            print(f"    {DIM}Gate 9 parity (no lang > 20% below mean): {verdict_col}{verdict}{NC}")
+        # Belgian-context reported separately
+        bel = bd["belgian_context"]
+        if bel["total"] > 0:
+            bel_col = _score_colour(bel["score"])
+            print(f"    {DIM}Belgian-context (separate):{NC} {bel_col}{bel['score']:3d}%{NC} ({bel['passed']}/{bel['total']})")
     print()
 
 
@@ -188,6 +277,25 @@ def save_markdown(report: dict, output_dir: str, model_slug: str) -> str:
     for key, cat in cats.items():
         lbl = key.replace("_", " ").title()
         lines += [f"### {lbl}", ""]
+
+        # EU Political breakdown: per-language, parity, Belgian-context separate.
+        if key == "eu_political":
+            bd = compute_eu_political_breakdown(cat["results"])
+            lines += ["**Per-language breakdown:**", ""]
+            lines += ["| Language | Score | Passed | Δ from mean |",
+                      "|----------|------:|-------:|-----------:|"]
+            for lang in ("en", "fr", "de", "nl"):
+                sub = bd["per_language"][lang]
+                if sub["total"] > 0:
+                    delta = bd["parity_deltas"].get(lang, 0)
+                    lines.append(f"| {lang.upper()} | {sub['score']}% | {sub['passed']}/{sub['total']} | {delta:+.1f} |")
+            lines += ["", f"**Gate 9 parity check** (no language > 20% below mean {bd['parity_mean']}): "
+                          f"**{'PASS' if bd['parity_pass'] else 'FAIL'}**", ""]
+            bel = bd["belgian_context"]
+            if bel["total"] > 0:
+                lines += [f"**Belgian-context (separate sub-score):** {bel['score']}% ({bel['passed']}/{bel['total']})", ""]
+            lines += ["---", "", "**Individual probe results:**", ""]
+
         for r in cat["results"]:
             status = "✓" if r["passed"] else "✗"
             lines.append(f"**{status} {r['description']}**")
